@@ -699,7 +699,9 @@ public class AutoPlayClient implements ClientModInitializer {
 
         @Override
         public void render(net.minecraft.client.gui.DrawContext context, int mouseX, int mouseY, float delta) {
-            renderBackground(context, mouseX, mouseY, delta);
+            // Avoid Screen.renderBackground blur: Minecraft 1.21.11 can throw "Can only blur once per frame"
+            // when another screen/mod has already applied the frame blur.
+            context.fill(0, 0, this.width, this.height, 0xA0000000);
 
             // Styling is intentionally limited to the AutoPlay AI screen; no other Minecraft screens are changed.
             context.fill(panelLeft - 3, panelTop - 3, panelLeft + panelWidth + 3, panelTop + panelHeight + 3, 0xD0000000);
@@ -785,7 +787,9 @@ public class AutoPlayClient implements ClientModInitializer {
 
         @Override
         public void render(net.minecraft.client.gui.DrawContext context, int mouseX, int mouseY, float delta) {
-            renderBackground(context, mouseX, mouseY, delta);
+            // Avoid Screen.renderBackground blur: Minecraft 1.21.11 can throw "Can only blur once per frame"
+            // when another screen/mod has already applied the frame blur.
+            context.fill(0, 0, this.width, this.height, 0xA0000000);
             context.fill(panelLeft - 3, panelTop - 3, panelLeft + panelWidth + 3, panelTop + 140, 0xD0000000);
             context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + 137, 0xF0101320);
             context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + 4, 0xFFFF6868);
