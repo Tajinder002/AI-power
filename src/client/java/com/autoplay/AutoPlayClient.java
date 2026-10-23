@@ -56,7 +56,7 @@ public class AutoPlayClient implements ClientModInitializer {
 
     // ----------------------------------------------------------- tunables
     private static final double TARGET_RANGE = 32.0;
-    private static final int BATCH = 128;               // learn every N ticks (and on every death)
+    private static final int BATCH = 48;                // more frequent reinforcement updates
     private static final float[] YAW_BINS = {-40f, -15f, -5f, 0f, 5f, 15f, 40f};
     private static final float[] PITCH_BINS = {-15f, -5f, 0f, 5f, 15f};
 
@@ -264,8 +264,12 @@ public class AutoPlayClient implements ClientModInitializer {
         }
 
         // ---- choose and apply a new action (teacher drives part of the time at first)
-        if (totalTicks % 20 == 0) useTeacher = brain.rnd.nextDouble() < brain.teacherProb;
-        brain.teacherProb = Math.max(0.02, brain.teacherProb - 0.00008);
+        // An untrained neural policy has random weights, so never let it control the bot
+        // before there are enough real demonstrations to make its actions meaningful.
+        if (totalTicks % 20 == 0) {
+            useTeacher = brain.dCount < 128 || brain.rnd.nextDouble() < brain.teacherProb;
+        }
+        brain.teacherProb = Math.max(0.20, brain.teacherProb - 0.00008); // faster hand-off as training improves
         applyAction(mc, p, brain.act(x, useTeacher ? teacherAction(raw, combatStyle) : null));
         prevRaw = raw;
         episodeTicks++;
@@ -324,9 +328,9 @@ public class AutoPlayClient implements ClientModInitializer {
         }
 
         // learn from what was recorded
-        if (brain.newDemos >= 32) {
+        if (brain.newDemos >= 8) {
             brain.newDemos = 0;
-            brain.trainDemos(1, 128);
+            brain.trainDemos(6, 128); // stronger, faster imitation updates per fresh demo batch
         }
 
         if (totalTicks % 6000 == 0) {
@@ -537,19 +541,30 @@ public class AutoPlayClient implements ClientModInitializer {
     // ----------------------------------------------------------------- teacher
 
     /** Simple hand-written fighter: face the enemy, walk up, hit when in reach. The AI copies it early on. */
-    private static int[] teacherAction(double[] r, CombatStyle style) {
+    private int[] teacherAction(double[] r, CombatStyle style) {
         boolean has = r[HAS] == 1;
         double dist = r[DIST];
-        int forward = 0, sprint = 0, attack = 0;
+        int forward = 0, strafe = 0, sprint = 0, attack = 0, jump = 0;
         if (has) {
-            forward = dist > 2.5 ? 1 : 0;
-            sprint = dist > 5 ? 1 : 0;
-            if (dist < 3.3 && Math.abs(r[YAW]) < 15 && Math.abs(r[PITCH]) < 20 && r[CD] > 0.9) attack = 1;
+            // Deliberate spacing: close distance when far, stop charging when in melee range,
+            // and circle-strafe in short phases instead of choosing random directions.
+            forward = dist > 3.0 ? 1 : (dist < 1.8 ? 2 : 0);
+            sprint = dist > 5.5 ? 1 : 0;
+            if (dist >= 2.0 && dist <= 6.5) {
+                strafe = ((totalTicks / 24) % 2 == 0) ? 1 : 2;
+            }
+            // Short, occasional grounded jumps in close sword/axe fights, not continuous hopping.
+            if ((style == CombatStyle.AUTO || style == CombatStyle.SWORD || style == CombatStyle.AXE)
+                    && dist >= 2.2 && dist <= 4.0 && r[GROUND] == 1
+                    && totalTicks % 50 < 3) jump = 1;
+            if (dist < 3.3 && Math.abs(r[YAW]) < 12 && Math.abs(r[PITCH]) < 18 && r[CD] > 0.92) attack = 1;
         }
         int yaw = has ? nearest(YAW_BINS, (float) (0.4 * r[YAW])) : 3;
         int pitch = has ? nearest(PITCH_BINS, (float) (0.4 * r[PITCH])) : 2;
         int[] a = new int[Brain.ACTN];
         a[A_FWD] = forward;
+        a[A_STR] = strafe;
+        a[A_JUMP] = jump;
         a[A_SPR] = sprint;
         a[A_ATK] = attack;
         a[A_YAW] = yaw;
@@ -678,7 +693,7 @@ public class AutoPlayClient implements ClientModInitializer {
             }).dimensions(buttonX, buttonY + gap * 3, buttonW, buttonH).build());
 
             addDrawableChild(ButtonWidget.builder(Text.literal(explorationLabel()), b -> {
-                brain.explorationRate = brain.explorationRate > 0 ? 0 : 0.08;
+                brain.explorationRate = brain.explorationRate > 0 ? 0 : 0.01;
                 b.setMessage(Text.literal(explorationLabel()));
             }).dimensions(buttonX, buttonY + gap * 4, buttonW, buttonH).build());
 
@@ -832,7 +847,7 @@ public class AutoPlayClient implements ClientModInitializer {
     static final class Brain {
         static final int IN = 64, H = 96, OUT = 38, ACTN = 10;
         static final int[] HEADS = {3, 3, 2, 2, 2, 2, 10, 7, 5, 2};
-        static final double GAMMA = 0.99, LAMBDA = 0.95, LR = 0.0015, ENT = 0.06, VC = 0.5, MAX_GRAD = 5.0;
+        static final double GAMMA = 0.99, LAMBDA = 0.95, LR = 0.0022, ENT = 0.020, VC = 0.5, MAX_GRAD = 5.0;
 
         // parameter layout inside one flat array
         static final int O_W1 = 0;
@@ -879,8 +894,8 @@ public class AutoPlayClient implements ClientModInitializer {
         final byte[][] dAct = new byte[CAPD][ACTN];
         int dCount = 0, dHead = 0, newDemos = 0;
 
-        double teacherProb = 0.05; // rely on learned policy; use the simple teacher only rarely
-        double explorationRate = 0.08; // configurable exploration for discovering alternatives
+        double teacherProb = 0.85; // start learning the policy sooner, while retaining a baseline
+        double explorationRate = 0.005; // very low random exploration; learning comes mainly from feedback and demos
 
         // lifetime stats (saved with the weights)
         int deaths = 0, kills = 0, bestTicks = 0;
@@ -901,7 +916,7 @@ public class AutoPlayClient implements ClientModInitializer {
             Arrays.fill(m, 0);
             Arrays.fill(v, 0);
             adamT = 0;
-            teacherProb = 0.05;
+            teacherProb = 0.85;
             deaths = 0;
             kills = 0;
             bestTicks = 0;
@@ -1123,7 +1138,7 @@ public class AutoPlayClient implements ClientModInitializer {
             step(n);
             n = 0;
 
-            trainDemos(1, 64); // keep the recorded human play in the mix
+            trainDemos(5, 128); // faster imitation updates after each reinforcement batch
         }
 
         // ------------------------------------------------ imitation learning
@@ -1176,7 +1191,7 @@ public class AutoPlayClient implements ClientModInitializer {
                 deaths = in.readInt();
                 kills = in.readInt();
                 bestTicks = in.readInt();
-                teacherProb = Math.max(0.02, Math.min(0.05, in.readDouble()));
+                teacherProb = Math.max(0.25, Math.min(0.92, in.readDouble()));
             } catch (IOException ignored) { }
         }
 
