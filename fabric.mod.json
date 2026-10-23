@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "autoplay",
+  "version": "0.1.0",
+  "name": "AutoPlay AI",
+  "description": "Press K and an AI plays PvP for you, learning from every death.",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.autoplay.AutoPlayClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.17.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
