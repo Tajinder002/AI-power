@@ -3,6 +3,7 @@ package com.autoplay;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
@@ -58,16 +59,46 @@ public class AutoPlayClient implements ClientModInitializer {
     private static final float[] YAW_BINS = {-40f, -15f, -5f, 0f, 5f, 15f, 40f};
     private static final float[] PITCH_BINS = {-15f, -5f, 0f, 5f, 15f};
 
-    // raw observation indices
+    // raw observation indices (what the AI "sees"; RAW_N must equal Brain.IN)
     private static final int HP = 0, FOOD = 1, HAS = 2, DIST = 3, YAW = 4, PITCH = 5, DY = 6,
             VX = 7, VY = 8, VZ = 9, GROUND = 10, CD = 11, EHP = 12,
-            SWORD = 13, OBSI = 14, CRYS_ITEM = 15, FOOD_ITEM = 16, TOTEM = 17,
-            HAS_C = 18, C_DIST = 19, C_YAW = 20, C_PITCH = 21, LOOK_BLK = 22, BLK_TO_E = 23, C_TO_E = 24,
-            RAW_N = 25;
+            HELD = 13,                        // 13..29: one flag per held-item type (17 types)
+            OFF_TOTEM = 30, OFF_SHIELD = 31, OFF_OTHER = 32,
+            SLOT_LOC = 33,                    // 33..44: which hotbar slot holds each key item (0 = none)
+            HAS_C = 45, C_DIST = 46, C_YAW = 47, C_PITCH = 48,
+            LOOK_BLK = 49, BLK_TO_E = 50, C_TO_E = 51,
+            S_USING = 52, S_BLOCK = 53, S_SNEAK = 54, S_FALL = 55,
+            E_RANGED = 56, E_CRYSTAL = 57, E_HEAVY = 58, E_BLOCK = 59, E_USING = 60,
+            E_VX = 61, E_VY = 62, E_VZ = 63,
+            RAW_N = 64;
+
+    // item types that get a hotbar locator (see category())
+    private static final int[] HOTBAR_CATS = {1, 2, 3, 4, 7, 8, 9, 10, 12, 13, 14, 16};
+
+    // scale each raw number to roughly -1..1 for the network
+    private static final double[] SCALE = new double[RAW_N];
+    static {
+        Arrays.fill(SCALE, 1.0);
+        SCALE[HP] = 1 / 20.0;
+        SCALE[FOOD] = 1 / 20.0;
+        SCALE[DIST] = 1 / 32.0;
+        SCALE[YAW] = 1 / 180.0;
+        SCALE[PITCH] = 1 / 90.0;
+        SCALE[DY] = 1 / 8.0;
+        SCALE[VX] = SCALE[VY] = SCALE[VZ] = 4;
+        SCALE[EHP] = 1 / 20.0;
+        SCALE[C_DIST] = 1 / 16.0;
+        SCALE[C_YAW] = 1 / 180.0;
+        SCALE[C_PITCH] = 1 / 90.0;
+        SCALE[BLK_TO_E] = 1 / 8.0;
+        SCALE[C_TO_E] = 1 / 8.0;
+        SCALE[S_FALL] = 0.1;
+        SCALE[E_VX] = SCALE[E_VY] = SCALE[E_VZ] = 4;
+    }
 
     // action head indices (see Brain.HEADS)
     private static final int A_FWD = 0, A_STR = 1, A_JUMP = 2, A_SPR = 3, A_ATK = 4,
-            A_USE = 5, A_SLOT = 6, A_YAW = 7, A_PITCH = 8;
+            A_USE = 5, A_SLOT = 6, A_YAW = 7, A_PITCH = 8, A_SNEAK = 9;
 
     private static KeyBinding toggleKey;
 
@@ -87,6 +118,10 @@ public class AutoPlayClient implements ClientModInitializer {
     private boolean useTeacher = false;
     private int watchSamples = 0;
 
+    // smooth aiming: the AI picks a turn SPEED once per tick; the camera is rotated a little every frame
+    private float aimVelYaw = 0f, aimVelPitch = 0f;   // degrees per tick
+    private long lastFrameNs = 0;
+
     private Track meTrack = new Track();
     private final Map<UUID, Track> tracks = new HashMap<>();
 
@@ -96,6 +131,9 @@ public class AutoPlayClient implements ClientModInitializer {
         double px, py, pz;
         float pyaw, ppitch, pswing;
         int pslot;
+        double peakY;                 // highest point since last on the ground (for falling attacks)
+        Entity lastTarget;            // who we were fighting last tick (to measure their speed)
+        double tx, ty, tz;
 
         void advance(PlayerEntity a) {
             px = a.getX();
@@ -121,6 +159,7 @@ public class AutoPlayClient implements ClientModInitializer {
                 new KeyBinding("key.autoplay.toggle", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, category));
 
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
+        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> onFrame());
     }
 
     // ------------------------------------------------------------ start / stop
@@ -136,12 +175,16 @@ public class AutoPlayClient implements ClientModInitializer {
         meTrack = new Track();
         tracks.clear();
         brain.discard();
+        aimVelYaw = 0f;
+        aimVelPitch = 0f;
         say(mc, m == Mode.AUTOPLAY ? "AutoPlay ON: the AI is playing and learning"
                 : "Watch mode ON: play normally, the AI is learning from you");
     }
 
     private void stop(MinecraftClient mc) {
         mode = Mode.OFF;
+        aimVelYaw = 0f;
+        aimVelPitch = 0f;
         brain.discard();
         KeyBinding.unpressAll();
         brain.save(savePath);
@@ -167,6 +210,24 @@ public class AutoPlayClient implements ClientModInitializer {
 
         if (mode == Mode.WATCH) watchTick(mc, p);
         else autoTick(mc, p);
+    }
+
+    // ------------------------------------------------------ smooth aiming (every frame)
+
+    /** Runs every rendered frame (60+ per second): turns the camera a small step, like a mouse would. */
+    private void onFrame() {
+        long now = System.nanoTime();
+        float dt = lastFrameNs == 0 ? 0f : (now - lastFrameNs) / 50_000_000f; // in game ticks
+        lastFrameNs = now;
+        if (mode != Mode.AUTOPLAY) return;
+
+        MinecraftClient mc = MinecraftClient.getInstance();
+        ClientPlayerEntity p = mc.player;
+        if (p == null || mc.currentScreen != null || p.isDead()) return;
+
+        dt = Math.min(dt, 2f);
+        // changeLookDirection is what the mouse uses (it multiplies by 0.15 degrees per unit)
+        p.changeLookDirection(aimVelYaw * dt / 0.15, aimVelPitch * dt / 0.15);
     }
 
     // ---------------------------------------------------------- mode 1: AutoPlay
@@ -219,6 +280,8 @@ public class AutoPlayClient implements ClientModInitializer {
     private void onDeath() {
         deathReported = true;
         ticksDead = 0;
+        aimVelYaw = 0f;
+        aimVelPitch = 0f;
         KeyBinding.unpressAll();
         if (brain.hasPending()) {
             brain.reward(-5.0, true);
@@ -264,7 +327,7 @@ public class AutoPlayClient implements ClientModInitializer {
             brain.trainDemos(1, 128);
         }
 
-        if (totalTicks % 3000 == 0) {
+        if (totalTicks % 6000 == 0) {
             brain.save(savePath);
             brain.saveDemos(demoPath);
         }
@@ -280,7 +343,7 @@ public class AutoPlayClient implements ClientModInitializer {
         double vx = actor.getX() - t.px, vy = actor.getY() - t.py, vz = actor.getZ() - t.pz;
         float yawDelta = MathHelper.wrapDegrees(actor.getYaw() - t.pyaw);
         float pitchDelta = actor.getPitch() - t.ppitch;
-        ItemStack main = actor.getMainHandStack();
+        int heldCat = category(actor.getMainHandStack());
 
         if (isMe) {
             // my real key presses
@@ -289,6 +352,7 @@ public class AutoPlayClient implements ClientModInitializer {
             a[A_JUMP] = mc.options.jumpKey.isPressed() ? 1 : 0;
             a[A_ATK] = mc.options.attackKey.isPressed() ? 1 : 0;
             a[A_USE] = mc.options.useKey.isPressed() ? 1 : 0;
+            a[A_SNEAK] = mc.options.sneakKey.isPressed() ? 1 : 0;
             int slot = actor.getInventory().getSelectedSlot();
             a[A_SLOT] = slot != t.pslot ? slot + 1 : 0;
         } else {
@@ -301,9 +365,11 @@ public class AutoPlayClient implements ClientModInitializer {
             a[A_JUMP] = (!actor.isOnGround() && vy > 0.1) ? 1 : 0;
             float sw = actor.getHandSwingProgress(0f);
             boolean swung = sw > 0 && t.pswing == 0;
-            boolean placing = main.isOf(Items.END_CRYSTAL) || main.getItem() instanceof BlockItem;
-            a[A_ATK] = (swung && !placing) ? 1 : 0;
-            a[A_USE] = ((swung && placing) || actor.isUsingItem()) ? 1 : 0;
+            boolean usesItem = heldCat == 7 || heldCat == 8 || heldCat == 10 || heldCat == 12
+                    || heldCat == 13 || heldCat == 14 || heldCat == 15 || heldCat == 16;
+            a[A_ATK] = (swung && !usesItem) ? 1 : 0;
+            a[A_USE] = ((swung && usesItem) || actor.isUsingItem()) ? 1 : 0;
+            a[A_SNEAK] = actor.isSneaking() ? 1 : 0;
             a[A_SLOT] = 0;
         }
         a[A_SPR] = actor.isSprinting() ? 1 : 0;
@@ -313,6 +379,28 @@ public class AutoPlayClient implements ClientModInitializer {
     }
 
     // ------------------------------------------------------------- observation
+
+    /** What kind of item is this? Lets the AI tell swords, axes, maces, bows, crystals, pearls... apart. */
+    private static int category(ItemStack s) {
+        if (s == null || s.isEmpty()) return 0;
+        if (s.isIn(ItemTags.SWORDS)) return 1;
+        if (s.isIn(ItemTags.AXES)) return 2;
+        if (s.isOf(Items.MACE)) return 3;
+        if (s.isOf(Items.BOW) || s.isOf(Items.CROSSBOW)) return 4;
+        if (s.isOf(Items.TRIDENT)) return 5;
+        if (s.isOf(Items.SHIELD)) return 6;
+        if (s.isOf(Items.END_CRYSTAL)) return 7;
+        if (s.isOf(Items.RESPAWN_ANCHOR) || s.isOf(Items.GLOWSTONE)) return 15;
+        if (s.isOf(Items.COBWEB)) return 16;
+        if (s.getItem() instanceof BlockItem) return 8;
+        if (s.isOf(Items.GOLDEN_APPLE) || s.isOf(Items.ENCHANTED_GOLDEN_APPLE)) return 9;
+        if (s.isOf(Items.ENDER_PEARL)) return 10;
+        if (s.isOf(Items.TOTEM_OF_UNDYING)) return 11;
+        if (s.isOf(Items.WIND_CHARGE)) return 12;
+        if (s.isOf(Items.POTION) || s.isOf(Items.SPLASH_POTION) || s.isOf(Items.LINGERING_POTION)) return 13;
+        if (s.isOf(Items.WATER_BUCKET) || s.isOf(Items.LAVA_BUCKET)) return 14;
+        return 17;
+    }
 
     private double[] observe(MinecraftClient mc, PlayerEntity a, LivingEntity tgt, Track t, boolean isMe) {
         double[] o = new double[RAW_N];
@@ -330,7 +418,25 @@ public class AutoPlayClient implements ClientModInitializer {
             o[DIST] = ae[2];
             o[DY] = ae[3];
             o[EHP] = tgt.getHealth();
+
+            // what the enemy is doing / holding and how fast it moves
+            int ec = category(tgt.getMainHandStack());
+            o[E_RANGED] = (ec == 4 || ec == 5) ? 1 : 0;
+            o[E_CRYSTAL] = (ec == 7 || ec == 15) ? 1 : 0;
+            o[E_HEAVY] = (ec == 2 || ec == 3) ? 1 : 0;
+            o[E_BLOCK] = tgt.isBlocking() ? 1 : 0;
+            o[E_USING] = tgt.isUsingItem() ? 1 : 0;
+            if (t.lastTarget == tgt) {
+                o[E_VX] = tgt.getX() - t.tx;
+                o[E_VY] = tgt.getY() - t.ty;
+                o[E_VZ] = tgt.getZ() - t.tz;
+            }
+            t.tx = tgt.getX();
+            t.ty = tgt.getY();
+            t.tz = tgt.getZ();
         }
+        t.lastTarget = tgt;
+
         if (t.init) {
             o[VX] = a.getX() - t.px;
             o[VY] = a.getY() - t.py;
@@ -339,12 +445,30 @@ public class AutoPlayClient implements ClientModInitializer {
         o[GROUND] = a.isOnGround() ? 1 : 0;
         o[CD] = isMe ? a.getAttackCooldownProgress(0f) : 1.0;
 
-        ItemStack main = a.getMainHandStack();
-        o[SWORD] = main.isIn(ItemTags.SWORDS) ? 1 : 0;
-        o[OBSI] = main.isOf(Items.OBSIDIAN) ? 1 : 0;
-        o[CRYS_ITEM] = main.isOf(Items.END_CRYSTAL) ? 1 : 0;
-        o[FOOD_ITEM] = (main.isOf(Items.GOLDEN_APPLE) || main.isOf(Items.ENCHANTED_GOLDEN_APPLE)) ? 1 : 0;
-        o[TOTEM] = a.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING) ? 1 : 0;
+        // held items
+        int cat = category(a.getMainHandStack());
+        if (cat >= 1 && cat <= 17) o[HELD + cat - 1] = 1;
+        int oc = category(a.getOffHandStack());
+        o[OFF_TOTEM] = oc == 11 ? 1 : 0;
+        o[OFF_SHIELD] = oc == 6 ? 1 : 0;
+        o[OFF_OTHER] = (oc != 0 && oc != 11 && oc != 6) ? 1 : 0;
+        if (isMe) { // we can only see our own hotbar
+            for (int i = 0; i < 9; i++) {
+                int c = category(a.getInventory().getStack(i));
+                for (int k = 0; k < HOTBAR_CATS.length; k++) {
+                    if (HOTBAR_CATS[k] == c && o[SLOT_LOC + k] == 0) o[SLOT_LOC + k] = (i + 1) / 9.0;
+                }
+            }
+        }
+
+        // own state
+        o[S_USING] = a.isUsingItem() ? 1 : 0;
+        o[S_BLOCK] = a.isBlocking() ? 1 : 0;
+        o[S_SNEAK] = a.isSneaking() ? 1 : 0;
+        double y = a.getY();
+        if (!t.init) t.peakY = y;
+        t.peakY = a.isOnGround() ? y : Math.max(t.peakY, y);
+        o[S_FALL] = Math.max(0, t.peakY - y);
 
         // nearest end crystal
         EndCrystalEntity best = null;
@@ -367,7 +491,7 @@ public class AutoPlayClient implements ClientModInitializer {
             if (tc != null) o[C_TO_E] = cc.distanceTo(tc);
         }
 
-        // block under the crosshair (where obsidian/crystals would go)
+        // block under the crosshair (where obsidian/crystals/webs would go)
         HitResult hr = a.raycast(5.0, 0f, false);
         if (hr.getType() == HitResult.Type.BLOCK) {
             o[LOOK_BLK] = 1;
@@ -386,12 +510,8 @@ public class AutoPlayClient implements ClientModInitializer {
     }
 
     private static double[] normalize(double[] r) {
-        double[] x = {
-                r[HP] / 20, r[FOOD] / 20, r[HAS], r[DIST] / 32, r[YAW] / 180, r[PITCH] / 90, r[DY] / 8,
-                r[VX] * 4, r[VY] * 4, r[VZ] * 4, r[GROUND], r[CD], r[EHP] / 20,
-                r[SWORD], r[OBSI], r[CRYS_ITEM], r[FOOD_ITEM], r[TOTEM],
-                r[HAS_C], r[C_DIST] / 16, r[C_YAW] / 180, r[C_PITCH] / 90, r[LOOK_BLK], r[BLK_TO_E] / 8, r[C_TO_E] / 8};
-        for (int i = 0; i < x.length; i++) x[i] = Math.max(-3, Math.min(3, x[i]));
+        double[] x = new double[RAW_N];
+        for (int i = 0; i < RAW_N; i++) x[i] = Math.max(-3, Math.min(3, r[i] * SCALE[i]));
         return x;
     }
 
@@ -424,14 +544,16 @@ public class AutoPlayClient implements ClientModInitializer {
             sprint = dist > 5 ? 1 : 0;
             if (dist < 3.3 && Math.abs(r[YAW]) < 15 && Math.abs(r[PITCH]) < 20 && r[CD] > 0.9) attack = 1;
         }
-        int yaw = has ? nearest(YAW_BINS, (float) r[YAW]) : 3;
-        int pitch = has ? nearest(PITCH_BINS, (float) r[PITCH]) : 2;
+        int yaw = has ? nearest(YAW_BINS, (float) (0.4 * r[YAW])) : 3;
+        int pitch = has ? nearest(PITCH_BINS, (float) (0.4 * r[PITCH])) : 2;
         int[] a = new int[Brain.ACTN];
         a[A_FWD] = forward;
         a[A_SPR] = sprint;
         a[A_ATK] = attack;
         a[A_YAW] = yaw;
         a[A_PITCH] = pitch;
+        // not holding a sword but has one in the hotbar? switch to it
+        if (r[HELD] == 0 && r[SLOT_LOC] > 0) a[A_SLOT] = (int) Math.round(r[SLOT_LOC] * 9);
         return a;
     }
 
@@ -453,11 +575,13 @@ public class AutoPlayClient implements ClientModInitializer {
         mc.options.jumpKey.setPressed(a[A_JUMP] == 1);
         mc.options.sprintKey.setPressed(a[A_SPR] == 1 && a[A_FWD] == 1);
         mc.options.useKey.setPressed(a[A_USE] == 1);
+        mc.options.sneakKey.setPressed(a[A_SNEAK] == 1);
 
         if (a[A_SLOT] > 0) p.getInventory().setSelectedSlot(a[A_SLOT] - 1);
 
-        p.setYaw(p.getYaw() + YAW_BINS[a[A_YAW]]);
-        p.setPitch(MathHelper.clamp(p.getPitch() + PITCH_BINS[a[A_PITCH]], -90f, 90f));
+        // ease toward the wanted turn speed (no sudden whips); onFrame() does the actual turning
+        aimVelYaw += (YAW_BINS[a[A_YAW]] - aimVelYaw) * 0.3f;
+        aimVelPitch += (PITCH_BINS[a[A_PITCH]] - aimVelPitch) * 0.3f;
 
         if (a[A_ATK] == 1) {
             HitResult hit = mc.crosshairTarget;
@@ -539,14 +663,14 @@ public class AutoPlayClient implements ClientModInitializer {
 
     // BRAIN-START
     // =====================================================================
-    //  The brain: small actor-critic network (25 -> 64 -> 64 -> 36 + value)
-    //  Actions are 9 independent choices:
-    //  forward/back(3) strafe(3) jump(2) sprint(2) attack(2) use(2) hotbar(10) yaw(7) pitch(5)
+    //  The brain: small actor-critic network (64 -> 96 -> 96 -> 38 + value)
+    //  Actions are 10 independent choices:
+    //  forward/back(3) strafe(3) jump(2) sprint(2) attack(2) use(2) hotbar(10) yaw(7) pitch(5) sneak(2)
     //  It learns two ways: trial and error (A2C) and copying recorded play (imitation).
     // =====================================================================
     static final class Brain {
-        static final int IN = 25, H = 64, OUT = 36, ACTN = 9;
-        static final int[] HEADS = {3, 3, 2, 2, 2, 2, 10, 7, 5};
+        static final int IN = 64, H = 96, OUT = 38, ACTN = 10;
+        static final int[] HEADS = {3, 3, 2, 2, 2, 2, 10, 7, 5, 2};
         static final double GAMMA = 0.99, LAMBDA = 0.95, LR = 0.003, ENT = 0.01, VC = 0.5, MAX_GRAD = 5.0;
 
         // parameter layout inside one flat array
@@ -559,7 +683,7 @@ public class AutoPlayClient implements ClientModInitializer {
         static final int O_WV = O_BP + OUT;
         static final int O_BV = O_WV + H;
         static final int N = O_BV + 1;
-        static final int MAGIC = 0xA17B0003;
+        static final int MAGIC = 0xA17B0004;
         static final int CAP = 1024;     // trial-and-error buffer
         static final int CAPD = 20000;   // recorded demonstrations
 
@@ -628,6 +752,7 @@ public class AutoPlayClient implements ClientModInitializer {
             w[O_BP + 14] += 3.0;   // hotbar: mostly keep
             w[O_BP + 27] += 1.5;   // yaw: mostly no turn
             w[O_BP + 33] += 1.5;   // pitch: mostly no turn
+            w[O_BP + 36] += 1.5;   // sneak: mostly don't
         }
 
         private void init(int off, int len, double scale) {
