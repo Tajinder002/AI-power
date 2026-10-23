@@ -52,6 +52,7 @@ import java.util.UUID;
 public class AutoPlayClient implements ClientModInitializer {
 
     private enum Mode { OFF, AUTOPLAY, WATCH }
+    private enum CombatStyle { AUTO, SWORD, AXE, CRYSTAL, MACE, BOW }
 
     // ----------------------------------------------------------- tunables
     private static final double TARGET_RANGE = 32.0;
@@ -108,6 +109,7 @@ public class AutoPlayClient implements ClientModInitializer {
 
     private Mode mode = Mode.OFF;
     private boolean learnOthers = true;
+    private CombatStyle combatStyle = CombatStyle.AUTO;
 
     private LivingEntity target;
     private double[] prevRaw;
@@ -263,8 +265,8 @@ public class AutoPlayClient implements ClientModInitializer {
 
         // ---- choose and apply a new action (teacher drives part of the time at first)
         if (totalTicks % 20 == 0) useTeacher = brain.rnd.nextDouble() < brain.teacherProb;
-        brain.teacherProb = Math.max(0.05, brain.teacherProb - 0.00003);
-        applyAction(mc, p, brain.act(x, useTeacher ? teacherAction(raw) : null));
+        brain.teacherProb = Math.max(0.02, brain.teacherProb - 0.00008);
+        applyAction(mc, p, brain.act(x, useTeacher ? teacherAction(raw, combatStyle) : null));
         prevRaw = raw;
         episodeTicks++;
         totalTicks++;
@@ -519,14 +521,14 @@ public class AutoPlayClient implements ClientModInitializer {
 
     private static double reward(double[] a, double[] b, int killed) {
         double r = -0.001;                       // tiny time cost: don't idle
-        if (killed == 1) r += 5.0;               // kill
-        r -= 0.1 * Math.max(0, a[HP] - b[HP]);   // damage taken
+        if (killed == 1) r += 8.0;               // kill
+        r -= 0.35 * Math.max(0, a[HP] - b[HP]);  // strongly discourage taking damage
         if (killed == 0 && a[HAS] == 1 && b[HAS] == 1) {
-            r += 0.15 * Math.max(0, a[EHP] - b[EHP]);               // damage dealt (swords AND crystals)
+            r += 0.50 * Math.max(0, a[EHP] - b[EHP]);               // reward effective damage (sword/crystal/etc.)
             double aimA = Math.abs(a[YAW]) / 180 + Math.abs(a[PITCH]) / 90;
             double aimB = Math.abs(b[YAW]) / 180 + Math.abs(b[PITCH]) / 90;
-            r += 0.5 * (aimA - aimB);                                // turned toward enemy
-            r += 0.05 * (a[DIST] - b[DIST]);                         // got closer
+            r += 0.75 * (aimA - aimB);                               // reward turning toward the enemy
+            r += 0.10 * (a[DIST] - b[DIST]);                        // reward closing distance when appropriate
             if (Math.abs(b[YAW]) < 10 && Math.abs(b[PITCH]) < 10 && b[DIST] < 3.5) r += 0.01; // aimed & in reach
         }
         return Math.max(-6, Math.min(6, r));
@@ -535,7 +537,7 @@ public class AutoPlayClient implements ClientModInitializer {
     // ----------------------------------------------------------------- teacher
 
     /** Simple hand-written fighter: face the enemy, walk up, hit when in reach. The AI copies it early on. */
-    private static int[] teacherAction(double[] r) {
+    private static int[] teacherAction(double[] r, CombatStyle style) {
         boolean has = r[HAS] == 1;
         double dist = r[DIST];
         int forward = 0, sprint = 0, attack = 0;
@@ -552,8 +554,28 @@ public class AutoPlayClient implements ClientModInitializer {
         a[A_ATK] = attack;
         a[A_YAW] = yaw;
         a[A_PITCH] = pitch;
-        // not holding a sword but has one in the hotbar? switch to it
-        if (r[HELD] == 0 && r[SLOT_LOC] > 0) a[A_SLOT] = (int) Math.round(r[SLOT_LOC] * 9);
+        // Style-specific equipment preferences. This is a starter heuristic; the learned policy
+        // can still discover better actions from rewards and demonstrations.
+        int preferredLocator = switch (style) {
+            case AXE -> 1;       // HOTBAR_CATS index for axe
+            case CRYSTAL -> 4;   // end crystal
+            case MACE -> 2;      // mace
+            case BOW -> 3;       // bow/crossbow
+            case SWORD, AUTO -> 0;
+        };
+        int locator = SLOT_LOC + preferredLocator;
+        if (r[HELD] == 0 && r[locator] > 0) a[A_SLOT] = (int) Math.round(r[locator] * 9);
+        // Crystal style attempts to use the selected crystal/block item when aiming at a block
+        // near the opponent; it does not guarantee server-valid crystal placement.
+        if (style == CombatStyle.CRYSTAL && has && r[LOOK_BLK] == 1 && dist < 5.0
+                && (r[HELD + 6] == 1 || r[HELD + 7] == 1)) a[A_USE] = 1;
+        // Mace style favors a jump/fall setup when the opponent is below or the player is falling.
+        if (style == CombatStyle.MACE && has && (r[S_FALL] > 2.0 || r[DY] < -2.0)) a[A_ATK] = dist < 4.5 ? 1 : a[A_ATK];
+        // Ranged style backs away slightly and uses the bow when line-of-sight range is available.
+        if (style == CombatStyle.BOW && has) {
+            if (dist < 5.0) { a[A_FWD] = 2; a[A_SPR] = 0; }
+            if (dist < 18.0 && Math.abs(r[YAW]) < 12 && Math.abs(r[PITCH]) < 15) a[A_USE] = 1;
+        }
         return a;
     }
 
@@ -615,50 +637,185 @@ public class AutoPlayClient implements ClientModInitializer {
     //  The menu (press K)
     // ====================================================================
     private class ControlScreen extends Screen {
+        private int panelLeft, panelTop, panelWidth, panelHeight;
+
         ControlScreen() {
             super(Text.literal("AutoPlay AI"));
         }
 
         @Override
         protected void init() {
-            int w = 280;
-            int x = this.width / 2 - w / 2;
-            int y = this.height / 2 - 80;
+            clearChildren();
+            panelWidth = Math.min(390, this.width - 24);
+            panelHeight = 360;
+            panelLeft = (this.width - panelWidth) / 2;
+            panelTop = Math.max(8, (this.height - panelHeight) / 2);
 
-            ButtonWidget header = ButtonWidget.builder(Text.literal(String.format(Locale.ROOT,
-                    "AutoPlay AI | recorded fights: %d | deaths: %d", brain.dCount, brain.deaths)), b -> { })
-                    .dimensions(x, y, w, 20).build();
-            header.active = false;
-            addDrawableChild(header);
+            int buttonX = panelLeft + 20;
+            int buttonW = panelWidth - 40;
+            int buttonY = panelTop + 112;
+            int buttonH = 20;
+            int gap = 25;
 
-            addDrawableChild(ButtonWidget.builder(Text.literal("1) Start AutoPlay - AI plays and learns"), b -> {
+            addDrawableChild(ButtonWidget.builder(Text.literal("▶  Start AutoPlay  |  Play & learn"), b -> {
                 startMode(Mode.AUTOPLAY);
                 close();
-            }).dimensions(x, y + 30, w, 20).build());
+            }).dimensions(buttonX, buttonY, buttonW, buttonH).build());
 
-            addDrawableChild(ButtonWidget.builder(Text.literal("2) Watch mode - I play, AI watches and learns"), b -> {
+            addDrawableChild(ButtonWidget.builder(Text.literal("◉  Watch Mode  |  Learn from my play"), b -> {
                 startMode(Mode.WATCH);
                 close();
-            }).dimensions(x, y + 55, w, 20).build());
+            }).dimensions(buttonX, buttonY + gap, buttonW, buttonH).build());
 
             addDrawableChild(ButtonWidget.builder(Text.literal(othersLabel()), b -> {
                 learnOthers = !learnOthers;
                 b.setMessage(Text.literal(othersLabel()));
-            }).dimensions(x, y + 80, w, 20).build());
+            }).dimensions(buttonX, buttonY + gap * 2, buttonW, buttonH).build());
 
-            addDrawableChild(ButtonWidget.builder(Text.literal("Reset what the AI learned (keeps recorded fights)"), b -> {
+            addDrawableChild(ButtonWidget.builder(Text.literal(styleLabel()), b -> {
+                combatStyle = CombatStyle.values()[(combatStyle.ordinal() + 1) % CombatStyle.values().length];
+                b.setMessage(Text.literal(styleLabel()));
+            }).dimensions(buttonX, buttonY + gap * 3, buttonW, buttonH).build());
+
+            addDrawableChild(ButtonWidget.builder(Text.literal(explorationLabel()), b -> {
+                brain.explorationRate = brain.explorationRate > 0 ? 0 : 0.08;
+                b.setMessage(Text.literal(explorationLabel()));
+            }).dimensions(buttonX, buttonY + gap * 4, buttonW, buttonH).build());
+
+            addDrawableChild(ButtonWidget.builder(Text.literal("Reset brain  |  keep recordings"), b -> {
                 brain.resetWeights();
+                brain.discard();
                 brain.save(savePath);
-                b.setMessage(Text.literal("AI brain reset"));
-            }).dimensions(x, y + 105, w, 20).build());
+                b.setMessage(Text.literal("Brain reset successfully"));
+            }).dimensions(buttonX, buttonY + gap * 5, buttonW, buttonH).build());
+
+            addDrawableChild(ButtonWidget.builder(Text.literal("Reset ALL AI data…"), b -> {
+                MinecraftClient.getInstance().setScreen(new ConfirmResetScreen(this));
+            }).dimensions(buttonX, buttonY + gap * 6, buttonW, buttonH).build());
 
             addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
-                    .dimensions(x, y + 135, w, 20).build());
+                    .dimensions(buttonX, buttonY + gap * 7, buttonW, buttonH).build());
+        }
+
+        @Override
+        public void render(net.minecraft.client.gui.DrawContext context, int mouseX, int mouseY, float delta) {
+            renderBackground(context, mouseX, mouseY, delta);
+
+            // Styling is intentionally limited to the AutoPlay AI screen; no other Minecraft screens are changed.
+            context.fill(panelLeft - 3, panelTop - 3, panelLeft + panelWidth + 3, panelTop + panelHeight + 3, 0xD0000000);
+            context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + panelHeight, 0xF0101320);
+            context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + 4, 0xFF9B5CFF);
+            context.fill(panelLeft + 1, panelTop + 4, panelLeft + panelWidth - 1, panelTop + 5, 0xFF49316F);
+
+            // Header block
+            context.fill(panelLeft + 12, panelTop + 10, panelLeft + panelWidth - 12, panelTop + 76, 0xFF1B2032);
+            context.fill(panelLeft + 12, panelTop + 10, panelLeft + 15, panelTop + 76, 0xFF9B5CFF);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("AUTOPLAY AI"),
+                    this.width / 2, panelTop + 20, 0xFFFFFFFF);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("TRAIN  •  OBSERVE  •  IMPROVE"),
+                    this.width / 2, panelTop + 37, 0xFFC9B4FF);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("Your Minecraft combat assistant"),
+                    this.width / 2, panelTop + 54, 0xFFB9C0D4);
+
+            // Compact status cards
+            int cardY = panelTop + 84;
+            int cardGap = 8;
+            int cardW = (panelWidth - 40 - cardGap * 2) / 3;
+            int cardX1 = panelLeft + 20;
+            int cardX2 = cardX1 + cardW + cardGap;
+            int cardX3 = cardX2 + cardW + cardGap;
+            int cardBottom = cardY + 22;
+            context.fill(cardX1, cardY, cardX1 + cardW, cardBottom, 0xFF22283A);
+            context.fill(cardX2, cardY, cardX2 + cardW, cardBottom, 0xFF22283A);
+            context.fill(cardX3, cardY, cardX3 + cardW, cardBottom, 0xFF22283A);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("DEMOS " + brain.dCount),
+                    cardX1 + cardW / 2, cardY + 7, 0xFFBFA4FF);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("K/D " + brain.kills + "/" + brain.deaths),
+                    cardX2 + cardW / 2, cardY + 7, 0xFFFFA9A9);
+            String modeLabel = mode == Mode.OFF ? "READY" : mode.name();
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal(modeLabel),
+                    cardX3 + cardW / 2, cardY + 7, mode == Mode.OFF ? 0xFF8FE3B0 : 0xFFFFD479);
+
+            // Small section label and footer
+            context.drawTextWithShadow(textRenderer, Text.literal("AI CONTROLS  •  STYLE: " + combatStyle.name()),
+                    panelLeft + 20, panelTop + 107, 0xFF9DA8C4);
+            context.drawCenteredTextWithShadow(textRenderer,
+                    Text.literal("Explore " + (brain.explorationRate > 0 ? "ON" : "OFF") + "  •  Teacher " + Math.round(brain.teacherProb * 100) + "%"),
+                    this.width / 2, panelTop + panelHeight - 27, 0xFFC9B4FF);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("Press K to open this menu anytime"),
+                    this.width / 2, panelTop + panelHeight - 15, 0xFF9CA3B8);
+            super.render(context, mouseX, mouseY, delta);
         }
 
         private String othersLabel() {
-            return "Watch mode also learns from other players: " + (learnOthers ? "ON" : "OFF");
+            return "Learn from other players: " + (learnOthers ? "ON" : "OFF");
         }
+        private String styleLabel() { return "PvP style: " + combatStyle.name() + "  (click to cycle)"; }
+        private String explorationLabel() { return "Explore new actions: " + (brain.explorationRate > 0 ? "ON" : "OFF"); }
+    }
+
+    /** Confirmation screen so a misclick cannot erase the learned model and fight recordings. */
+    private class ConfirmResetScreen extends Screen {
+        private final Screen parent;
+        private int panelLeft, panelTop, panelWidth;
+
+        ConfirmResetScreen(Screen parent) {
+            super(Text.literal("Confirm AI data reset"));
+            this.parent = parent;
+        }
+
+        @Override
+        protected void init() {
+            panelWidth = Math.min(360, this.width - 24);
+            panelLeft = (this.width - panelWidth) / 2;
+            panelTop = this.height / 2 - 65;
+            int x = panelLeft + 18;
+            int w = panelWidth - 36;
+
+            addDrawableChild(ButtonWidget.builder(Text.literal("YES — delete all AI data"), b -> {
+                resetAllAiData();
+                MinecraftClient.getInstance().setScreen(new ControlScreen());
+                say(MinecraftClient.getInstance(), "All AI data reset. Training starts from scratch.");
+            }).dimensions(x, panelTop + 82, w, 20).build());
+
+            addDrawableChild(ButtonWidget.builder(Text.literal("Cancel"), b ->
+                    MinecraftClient.getInstance().setScreen(parent))
+                    .dimensions(x, panelTop + 108, w, 20).build());
+        }
+
+        @Override
+        public void render(net.minecraft.client.gui.DrawContext context, int mouseX, int mouseY, float delta) {
+            renderBackground(context, mouseX, mouseY, delta);
+            context.fill(panelLeft - 3, panelTop - 3, panelLeft + panelWidth + 3, panelTop + 140, 0xD0000000);
+            context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + 137, 0xF0101320);
+            context.fill(panelLeft, panelTop, panelLeft + panelWidth, panelTop + 4, 0xFFFF6868);
+            context.fill(panelLeft + 12, panelTop + 12, panelLeft + panelWidth - 12, panelTop + 67, 0xFF29202C);
+            context.drawCenteredTextWithShadow(textRenderer, Text.literal("RESET ALL AI DATA?"),
+                    this.width / 2, panelTop + 22, 0xFFFF8F8F);
+            context.drawCenteredTextWithShadow(textRenderer,
+                    Text.literal("The AI brain and recorded fights will be deleted."),
+                    this.width / 2, panelTop + 40, 0xFFFFFFFF);
+            context.drawCenteredTextWithShadow(textRenderer,
+                    Text.literal("Your mod and settings will remain installed."),
+                    this.width / 2, panelTop + 54, 0xFFB8B8C8);
+            super.render(context, mouseX, mouseY, delta);
+        }
+    }
+
+    /** Erase both persisted files and clear the in-memory model and demonstrations. */
+    private void resetAllAiData() {
+        mode = Mode.OFF;
+        target = null;
+        prevRaw = null;
+        aimVelYaw = 0f;
+        aimVelPitch = 0f;
+        KeyBinding.unpressAll();
+        brain.resetAllData();
+        try { java.nio.file.Files.deleteIfExists(savePath); } catch (IOException ignored) { }
+        try { java.nio.file.Files.deleteIfExists(demoPath); } catch (IOException ignored) { }
+        // Persist a clean brain and an empty demonstration file immediately.
+        brain.save(savePath);
+        brain.saveDemos(demoPath);
     }
 
     // BRAIN-START
@@ -671,7 +828,7 @@ public class AutoPlayClient implements ClientModInitializer {
     static final class Brain {
         static final int IN = 64, H = 96, OUT = 38, ACTN = 10;
         static final int[] HEADS = {3, 3, 2, 2, 2, 2, 10, 7, 5, 2};
-        static final double GAMMA = 0.99, LAMBDA = 0.95, LR = 0.003, ENT = 0.01, VC = 0.5, MAX_GRAD = 5.0;
+        static final double GAMMA = 0.99, LAMBDA = 0.95, LR = 0.0015, ENT = 0.06, VC = 0.5, MAX_GRAD = 5.0;
 
         // parameter layout inside one flat array
         static final int O_W1 = 0;
@@ -718,7 +875,8 @@ public class AutoPlayClient implements ClientModInitializer {
         final byte[][] dAct = new byte[CAPD][ACTN];
         int dCount = 0, dHead = 0, newDemos = 0;
 
-        double teacherProb = 0.8; // how often the built-in teacher drives; fades over time
+        double teacherProb = 0.05; // rely on learned policy; use the simple teacher only rarely
+        double explorationRate = 0.08; // configurable exploration for discovering alternatives
 
         // lifetime stats (saved with the weights)
         int deaths = 0, kills = 0, bestTicks = 0;
@@ -739,7 +897,7 @@ public class AutoPlayClient implements ClientModInitializer {
             Arrays.fill(m, 0);
             Arrays.fill(v, 0);
             adamT = 0;
-            teacherProb = 0.8;
+            teacherProb = 0.05;
             deaths = 0;
             kills = 0;
             bestTicks = 0;
@@ -753,6 +911,18 @@ public class AutoPlayClient implements ClientModInitializer {
             w[O_BP + 27] += 1.5;   // yaw: mostly no turn
             w[O_BP + 33] += 1.5;   // pitch: mostly no turn
             w[O_BP + 36] += 1.5;   // sneak: mostly don't
+        }
+
+        void resetAllData() {
+            resetWeights();
+            discard();
+            dCount = 0;
+            dHead = 0;
+            newDemos = 0;
+            for (int i = 0; i < CAPD; i++) {
+                Arrays.fill(dObs[i], 0f);
+                Arrays.fill(dAct[i], (byte) 0);
+            }
         }
 
         private void init(int off, int len, double scale) {
@@ -812,13 +982,19 @@ public class AutoPlayClient implements ClientModInitializer {
                 if (forced != null) {
                     a[h] = forced[h];
                 } else {
-                    double r = rnd.nextDouble(), c = 0;
-                    int pick = HEADS[h] - 1;
-                    for (int i = 0; i < HEADS[h]; i++) {
-                        c += probs[hs + i];
-                        if (r < c) { pick = i; break; }
+                    // Explicit exploration: occasionally try a different action instead of
+                    // repeatedly sampling the current policy's favourite move.
+                    if (rnd.nextDouble() < explorationRate) {
+                        a[h] = rnd.nextInt(HEADS[h]);
+                    } else {
+                        double r = rnd.nextDouble(), c = 0;
+                        int pick = HEADS[h] - 1;
+                        for (int i = 0; i < HEADS[h]; i++) {
+                            c += probs[hs + i];
+                            if (r < c) { pick = i; break; }
+                        }
+                        a[h] = pick;
                     }
-                    a[h] = pick;
                 }
                 hs += HEADS[h];
             }
@@ -933,7 +1109,10 @@ public class AutoPlayClient implements ClientModInitializer {
             mean /= n;
             for (double a : adv) var += (a - mean) * (a - mean);
             double std = Math.sqrt(var / n) + 1e-8;
-            for (int t = 0; t < n; t++) adv[t] = bTeacher[t] ? 1.0 : (adv[t] - mean) / std;
+            // Crucial: teacher actions are NOT automatically treated as good.
+            // Every action, including teacher-driven actions, is judged by its actual reward.
+            // This lets the policy learn alternatives that outperform the teacher.
+            for (int t = 0; t < n; t++) adv[t] = (adv[t] - mean) / std;
 
             Arrays.fill(g, 0);
             for (int t = 0; t < n; t++) accumulate(bObs[t], bAct[t], adv[t], ret[t], true, ENT);
@@ -993,7 +1172,7 @@ public class AutoPlayClient implements ClientModInitializer {
                 deaths = in.readInt();
                 kills = in.readInt();
                 bestTicks = in.readInt();
-                teacherProb = in.readDouble();
+                teacherProb = Math.max(0.02, Math.min(0.05, in.readDouble()));
             } catch (IOException ignored) { }
         }
 
